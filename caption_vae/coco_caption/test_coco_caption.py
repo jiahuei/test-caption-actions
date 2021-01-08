@@ -7,9 +7,9 @@ python -m unittest tests/test_coco_caption.py
 """
 import unittest
 import os
-from .coco_caption.eval import evaluate_caption_json
-from ..data.mscoco import MscocoDataset
-from ..utils.misc import BASE_DIR
+from coco_caption.eval import evaluate_caption_json
+from data.mscoco import MscocoDataset
+from utils.misc import BASE_DIR
 
 
 class TestSum(unittest.TestCase):
