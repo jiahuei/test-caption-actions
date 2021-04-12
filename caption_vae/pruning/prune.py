@@ -261,7 +261,7 @@ class PruningMixin:
         step = current_step / max_step
         step = 1.0 + torch.cos(torch.tensor(min(1.0, step) * math.pi))
         anneal_rate = step / 2
-        loss = loss * weight * (1. - anneal_rate)
+        loss = loss * weight #* (1. - anneal_rate)
         self.sparsity_loss["anneal_rate"] = anneal_rate
         self.sparsity_loss["loss_scaled"] = loss
 

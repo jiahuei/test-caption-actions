@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-@author: ruotianluo
+@author: jiahuei, ruotianluo
 """
 import logging
 import random
@@ -9,9 +9,10 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from copy import deepcopy
-from typing import Type, Callable, Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+USE_CUDA = torch.cuda.is_available()
 
 
 def set_seed(seed: int):
@@ -70,61 +71,36 @@ def reorder_beam(tensor: torch.Tensor, beam_idx: torch.Tensor, beam_dim: int = 0
     return tensor.index_select(beam_dim, beam_idx)
 
 
-def find_beam_parent_index(previous: torch.Tensor, current: torch.Tensor):
+def map_recursive(x: Any, func: Callable):
     """
-    Tensors must have shape (batch, beam, time, ...)
-    """
-    assert previous.dim() > 2, f"`previous` must have at least 3 dims (batch, beam, N). Saw {previous.shape}"
-    assert current.dim() > 2, f"`current` must have at least 3 dims (batch, beam, N). Saw {current.shape}"
-
-    batch, beam, ct = current.shape[:3]
-    pt = previous.size(2)
-    if ct != pt:
-        assert ct - pt == 1, (
-            f"Shape mismatch between `current` and `previous`. "
-            f"current = {current.shape}"
-            f"previous = {previous.shape}"
-        )
-        # current = current.index_select(time_dim, index=torch.arange(previous.size(time_dim)))
-        current = current[:, :, :-1, ...]
-    match = (previous.unsqueeze(1) == current.unsqueeze(2)).all(dim=-1)
-    loc = match.nonzero(as_tuple=False)[:, -1]
-    loc = loc.view(batch, beam)
-    offset = torch.arange(batch).unsqueeze(1) * beam
-    loc = (loc + offset).view(-1)
-    return loc
-
-
-def map_structure_recursive(
-        structure: Any,
-        func: Callable,
-        end_type: Type[torch.Tensor] = torch.Tensor
-):
-    """
-    Applies `func` to elements of structure recursively.
+    Applies `func` to elements of x recursively.
     Args:
-        structure: A `Tensor`, or a potentially nested structure containing `Tensor`.
+        x: An item or a potentially nested structure of tuple, list or dict.
         func: A single argument function.
-        end_type: The type of element that `func` expects. Defaults to `torch.Tensor`.
     Returns:
-        The same structure but with `func` applied.
+        The same x but with `func` applied.
     """
-    error_mssg = (
-        f"Expected `structure` to be either a `tuple`, `list` or `dict`, "
-        f"received {type(structure)} instead."
-    )
-    if isinstance(structure, end_type):
-        return func(structure)
-    elif structure is None:
-        return None
-    elif isinstance(structure, tuple):
-        return tuple(map_structure_recursive(item, func, end_type) for item in structure)
-    elif isinstance(structure, list):
-        return list(map_structure_recursive(item, func, end_type) for item in structure)
-    elif isinstance(structure, dict):
-        return {key: map_structure_recursive(value, func, end_type) for key, value in structure.items()}
+    if isinstance(x, tuple):
+        return tuple(map_recursive(item, func) for item in x)
+    elif isinstance(x, list):
+        return list(map_recursive(item, func) for item in x)
+    elif isinstance(x, dict):
+        return {key: map_recursive(value, func) for key, value in x.items()}
     else:
-        raise TypeError(error_mssg)
+        return func(x)
+
+
+def to_cuda(x: Any):
+    if USE_CUDA:
+        if isinstance(x, torch.Tensor):
+            x = x.cuda(non_blocking=True)
+        elif isinstance(x, nn.Module):
+            x.cuda()
+    return x
+
+
+def map_to_cuda(x: Any):
+    return map_recursive(x, to_cuda)
 
 
 def count_nonzero(tensor):
@@ -169,10 +145,6 @@ def length_average(length, logprobs, alpha=0.):
     return logprobs / length
 
 
-# bad_endings = ['a', 'an', 'the', 'in', 'for', 'at', 'of', 'with', 'before', 'after', 'on', 'upon', 'near', 'to', 'is',
-#                'are', 'am', 'the']
-
-
 def sort_pack_padded_sequence(inputs, lengths):
     sorted_lengths, indices = torch.sort(lengths, descending=True)
     tmp = pack_padded_sequence(inputs[indices], sorted_lengths, batch_first=True)
@@ -193,3 +165,8 @@ def pack_wrapper(module, att_feats, att_masks):
         return pad_unsort_packed_sequence(PackedSequence(module(packed[0]), packed[1]), inv_ix)
     else:
         return module(att_feats)
+
+
+def requires_grad(model, flag=True):
+    for p in model.parameters():
+        p.requires_grad = flag

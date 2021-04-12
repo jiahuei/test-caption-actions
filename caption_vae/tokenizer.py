@@ -21,12 +21,12 @@ import os
 import logging
 import shutil
 import stanza
+import itertools
 from argparse import ArgumentParser, _ArgumentGroup
 from abc import ABC, abstractmethod
-from typing import Type, Optional, Union, List, NamedTuple
+from typing import Union, List, NamedTuple
 from torch import Tensor
 from numpy import ndarray
-from utils.config import Config
 from sentencepiece import SentencePieceTrainer, SentencePieceProcessor
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def register_tokenizer(name):
             (...)
 
     Args:
-        name (str): the name of the model
+        name (str): the name of the tokenizer
     """
 
     def register_tokenizer_cls(cls):
@@ -64,8 +64,7 @@ def get_tokenizer(name: str):
         return TOKENIZER_REGISTRY[name]
     except KeyError:
         _list = "\n".join(TOKENIZER_REGISTRY.keys())
-        error_mssg = f"Tokenizer specified `{name}` is invalid. Available options are: \n{_list}"
-        raise ValueError(error_mssg)
+        raise ValueError(f"Tokenizer specified `{name}` is invalid. Available options are: \n{_list}")
 
 
 class PosTagger:
@@ -331,45 +330,12 @@ class SentencePieceUnigramTokenizer(Tokenizer):
         self.config = config
         self.tokenizer_dir = os.path.join(self.config.log_dir, "tokenizer")
         self.sp_model_path = os.path.join(self.tokenizer_dir, f"{self.MODEL_TYPE}.model")
-        # Maybe reload tokenizer from another training checkpoint dir
-        if not config.start_from:
-            start_from = ""
-        elif os.path.isfile(config.start_from):
-            start_from = os.path.dirname(config.start_from)
-        elif os.path.isdir(config.start_from):
-            start_from = config.start_from
-        else:
-            raise ValueError(
-                f"{self.__class__.__name__}: `config.start_from` must be either dir or file. "
-                f"Got `{config.start_from}`"
-            )
-        src_model_path = os.path.join(start_from, "tokenizer", f"{self.MODEL_TYPE}.model")
-        if not os.path.isfile(self.sp_model_path) and os.path.isfile(src_model_path):
-            # shutil.copytree(os.path.dirname(src_model_path), self.tokenizer_dir)
-            shutil.copy2(src_model_path, self.sp_model_path)
-            shutil.copy2(
-                src_model_path.replace(".model", ".vocab"),
-                self.sp_model_path.replace(".model", ".vocab")
-            )
-            train_file = os.path.join(self.tokenizer_dir, "train_captions.txt")
-            if os.path.isfile(train_file):
-                os.remove(train_file)
-            self.config.tokenizer_train_files = None
-        # Train the tokenizer if model file is not found
-        if not os.path.isfile(self.sp_model_path):
-            if not isinstance(self.config.tokenizer_train_files, str):
-                error_mssg = (
-                    "`config.tokenizer_train_files` must be provided in absence of `sp_model_path`."
-                )
-                raise ValueError(error_mssg)
-            sp_model_path = self.train()
-            logger.info(f"{self.__class__.__name__}: Tokenizer model saved to `{sp_model_path}`.")
-            assert self.sp_model_path == sp_model_path
+        sp_model_path = self.train()
+        assert self.sp_model_path == sp_model_path
         self._load_processor()
         # Copy tokenizer attributes over to Config
         for attr in self.special_token_attributes:
             self._update_config(attr, getattr(self, attr, None))
-        self._update_config("vocab_size", len(self))
         self._update_config("num_control_symbols", len(self.control_symbols))
         self._update_config("num_special_symbols", len(self.control_symbols) + 4)
         logger.info(f"{self.__class__.__name__}: Init complete.")
@@ -384,7 +350,7 @@ class SentencePieceUnigramTokenizer(Tokenizer):
             input_str: str,
             add_bos_eos: bool = True,
             max_seq_length: int = 16,
-            sampling=False,
+            sampling: bool = False,
     ) -> List[int]:
         if sampling:
             ids = self.processor.encode(
@@ -415,18 +381,17 @@ class SentencePieceUnigramTokenizer(Tokenizer):
             ids = ids[:max_seq_length]
         return ids
 
-    def decode(self, input_ids: List[int]) -> str:
+    def decode(self, input_ids: Union[List[int], Tensor, ndarray]) -> str:
         if isinstance(input_ids, (Tensor, ndarray)):
             if len(input_ids.shape) == 1:
-                input_ids = list(map(int, input_ids))
+                input_ids = input_ids.tolist()
             elif len(input_ids.shape) == 0:
                 input_ids = [int(input_ids)]
             else:
-                error_mssg = (
+                raise ValueError(
+                    f"{self.__class__.__name__}: "
                     f"`input_tensor` can be either 1D or 0D, saw `{len(input_ids.shape)}`D instead."
                 )
-                raise ValueError(error_mssg)
-        # TODO: remove after vocab_size is fixed
         input_ids = [_ if _ < len(self) else self.config.unk_token_id for _ in input_ids]
         sent = self.processor.decode_ids(input_ids).replace("<unk>", " <unk>")
         if sent.startswith(" "):
@@ -438,7 +403,40 @@ class SentencePieceUnigramTokenizer(Tokenizer):
         return self.process_tokens(" " + input_str, pieces, lambda x: x.replace("\u2581", " "))
 
     def train(self):
-        logger.info(f"{self.__class__.__name__}: Training on `{self.config.tokenizer_train_files}`.")
+        if os.path.isfile(self.sp_model_path):
+            logger.info(f"{self.__class__.__name__}: Found existing tokenizer model file.")
+            return self.sp_model_path
+        config = self.config
+
+        # Maybe reload tokenizer from another training checkpoint dir
+        if os.path.isfile(config.start_from):
+            start_from = os.path.dirname(config.start_from)
+        elif os.path.isdir(config.start_from):
+            start_from = config.start_from
+        else:
+            start_from = ""
+
+        src_model_path = os.path.join(start_from, "tokenizer", f"{self.MODEL_TYPE}.model")
+        if os.path.isfile(src_model_path):
+            # shutil.copytree(os.path.dirname(src_model_path), self.tokenizer_dir)
+            shutil.copy2(src_model_path, self.sp_model_path)
+            shutil.copy2(
+                src_model_path.replace(".model", ".vocab"),
+                self.sp_model_path.replace(".model", ".vocab")
+            )
+            train_file = os.path.join(self.tokenizer_dir, "train_captions.txt")
+            if os.path.isfile(train_file):
+                os.remove(train_file)
+            config.tokenizer_train_files = None
+            return self.sp_model_path
+
+        # Train the tokenizer if model file is not found
+        if not isinstance(config.tokenizer_train_files, str):
+            raise ValueError(
+                f"{self.__class__.__name__}: "
+                f"`config.tokenizer_train_files` must be provided in absence of `sp_model_path`."
+            )
+        logger.info(f"{self.__class__.__name__}: Training on `{config.tokenizer_train_files}`.")
         os.makedirs(self.tokenizer_dir, exist_ok=True)
 
         model_prefix = os.path.join(self.tokenizer_dir, self.MODEL_TYPE)
@@ -451,12 +449,12 @@ class SentencePieceUnigramTokenizer(Tokenizer):
         #     ), f"`user_defined_symbols` must not start with a comma `,`."
 
         log_level = 2
-        if isinstance(self.config.logging_level, int):
-            log_level = int((self.config.logging_level - 10) / 10)
+        if isinstance(config.logging_level, int):
+            log_level = int((config.logging_level - 10) / 10)
         SentencePieceTrainer.train(
-            f"--input={self.config.tokenizer_train_files} "
+            f"--input={config.tokenizer_train_files} "
             f"--model_prefix={model_prefix} "
-            f"--vocab_size={self.config.vocab_size} "
+            f"--vocab_size={config.vocab_size} "
             f"--hard_vocab_limit=false "  # Allow final vocab size to be smaller if training set is too small
             f"--model_type={self.MODEL_TYPE} "
             f"--pad_id=0 --unk_id=1 --bos_id=2 --eos_id=3 "
@@ -466,15 +464,20 @@ class SentencePieceUnigramTokenizer(Tokenizer):
             # f"--user_defined_symbols={user_defined_symbols} "
             # f"--minloglevel={log_level} "
         )
-        return f"{model_prefix}.model"
+        sp_model_path = f"{model_prefix}.model"
+        logger.info(f"{self.__class__.__name__}: Tokenizer model saved to `{sp_model_path}`.")
+        return sp_model_path
 
     def token_to_id(self, token):
         return self.processor.piece_to_id(token)
 
     def id_to_token(self, token_id):
         if token_id >= len(self):
-            error_mssg = f"`token_id` ({token_id}) exceeded the vocab size ({len(self)}). Max ID is `{len(self) - 1}`."
-            raise ValueError(error_mssg)
+            raise ValueError(
+                f"{self.__class__.__name__}: "
+                f"`token_id` ({token_id}) exceeded the vocab size ({len(self)}). "
+                f"Max ID is `{len(self) - 1}`."
+            )
         return self.processor.id_to_piece(token_id)
 
     def _load_processor(self):
@@ -569,3 +572,183 @@ class WordTokenizer(SentencePieceUnigramTokenizer):
     """
 
     MODEL_TYPE = "word"
+
+
+@register_tokenizer("radix")
+class RadixTokenizer(SentencePieceUnigramTokenizer):
+    """
+    Word tokenizer implemented using Sentence Piece.
+    """
+
+    MODEL_TYPE = "word"
+
+    def __init__(self, config):
+        super().__init__(config)
+        config.vocab_size = len(self)
+        self.radix_map = {}
+        # Do not consider <pad>, <bos>, <eos>
+        vocab_size = len(self.processor) - 3
+        # Create ID mapping
+        self.tokens_per_word = len(self.decimal_to_base(vocab_size, config.radix_base))
+        for i in range(vocab_size):
+            radix_id = self.decimal_to_base(i, config.radix_base)
+            radix_id = [1] * (self.tokens_per_word - len(radix_id)) + radix_id
+            self.radix_map[i] = radix_id
+        # pad_id=0 --unk_id=1 --bos_id=2 --eos_id=3
+        self.radix_map[-4] = [self.pad_token_id]
+        self.radix_map[-3] = self.radix_map[vocab_size - 1]  # Last slot is reserved for <unk>
+        self.radix_map[-2] = [self.bos_token_id]
+        self.radix_map[-1] = [self.eos_token_id]
+
+    def _encode_radix_id(self, word_ids: Union[int, List[int]]):
+        if isinstance(word_ids, int):
+            word_ids = [word_ids]
+        # Shift <pad>, <unk>, <bos>, <eos> to negative indices
+        word_ids = [x for y in map(lambda _: self.radix_map[_ - 4], word_ids) for x in y]
+        return word_ids
+
+    def _decode_radix_id(self, radix_id: int):
+        if radix_id == self.pad_token_id:
+            return 0
+        elif radix_id == self.bos_token_id:
+            return 2
+        elif radix_id == self.eos_token_id:
+            return 3
+        elif radix_id == self.unk_token_id:
+            return 1
+        else:
+            return self.base_to_decimal(radix_id, self.config.radix_base) + 4
+
+    def _decode_radix_ids(self, radix_ids: List[int]):
+        try:
+            radix_ids = radix_ids[:radix_ids.index(self.eos_token_id)]
+        except ValueError:
+            pass
+        radix_ids = self.grouper(radix_ids, self.tokens_per_word)
+        word_ids = [self._decode_radix_id(_) for _ in radix_ids]
+        return word_ids
+
+    def encode(
+            self,
+            input_str: str,
+            add_bos_eos: bool = True,
+            max_seq_length: int = 30,
+            sampling: bool = False,
+    ) -> List[int]:
+        assert isinstance(input_str, str), (
+            ""
+        )
+        max_seq_length = (max_seq_length - 2) // self.tokens_per_word + 2  # number of word tokens
+        ids = super().encode(input_str, add_bos_eos, max_seq_length, sampling)
+        ids = self._encode_radix_id(ids)
+        return ids
+
+    def encode_tokenized(
+            self,
+            input_list: List[str],
+            add_bos_eos: bool = True,
+            max_seq_length: int = 30,
+    ) -> List[int]:
+        assert isinstance(input_list, list)
+        ids = self.processor.piece_to_id(input_list)
+        if add_bos_eos:
+            ids = [self.bos_token_id] + self._encode_radix_id(ids) + [self.eos_token_id]
+        if max_seq_length > 0:
+            ids = ids[:max_seq_length]
+        return ids
+
+    def decode(self, input_ids: Union[List[int], Tensor, ndarray]) -> str:
+        if isinstance(input_ids, (Tensor, ndarray)):
+            if len(input_ids.shape) == 1:
+                input_ids = input_ids.tolist()
+            elif len(input_ids.shape) == 0:
+                input_ids = [int(input_ids)]
+            else:
+                raise ValueError(
+                    f"{self.__class__.__name__}: "
+                    f"`input_tensor` can be either 1D or 0D, saw `{len(input_ids.shape)}`D instead."
+                )
+        input_ids = self._decode_radix_ids(input_ids)
+        input_ids = [_ if _ < len(self.processor) else 1 for _ in input_ids]  # hard-code <unk> value for now
+        sent = self.processor.decode_ids(input_ids).replace("<unk>", " <unk>")
+        if sent.startswith(" "):
+            sent = sent[1:]
+        return sent
+
+    def token_to_id(self, token):
+        return self._encode_radix_id(super().token_to_id(token))
+
+    def id_to_token(self, token_id):
+        return super().id_to_token(self._decode_radix_id(token_id))
+
+    def __len__(self):
+        return self.config.radix_base + 3
+
+    @property
+    def bos_token_id(self):
+        """ Id of the beginning of sentence token in the vocabulary."""
+        return self.config.radix_base + 1  # Map <bos> to radix_base + 1
+
+    @property
+    def eos_token_id(self):
+        """ Id of the end of sentence token in the vocabulary."""
+        return self.config.radix_base + 2  # Map <eos> to radix_base + 2
+
+    @property
+    def unk_token_id(self):
+        """ Id of the unknown token in the vocabulary."""
+        return self.radix_map[-3]
+
+    @property
+    def pad_token_id(self):
+        """ Id of the padding token in the vocabulary."""
+        return 0
+
+    @property
+    def mask_token_id(self):
+        """ Id of the mask token in the vocabulary."""
+        return self.token_to_id("<mask>")
+
+    @staticmethod
+    def grouper(iterable, group_n, fill_value=1):
+        args = [iter(iterable)] * group_n
+        return list(itertools.zip_longest(fillvalue=fill_value, *args))
+
+    @staticmethod
+    def decimal_to_base(n, base):
+        """Function to convert any base-10 integer to base-N, shifted by 1."""
+        if base < 2:
+            raise ValueError('Base cannot be less than 2.')
+        if n < 0:
+            sign = -1
+            n *= sign
+        elif n == 0:
+            return [1]
+        else:
+            sign = 1
+        digits = []
+        while n:
+            digits.append((sign * int(n % base)) + 1)
+            n //= base
+        return digits[::-1]
+
+    @staticmethod
+    def base_to_decimal(digits, radix):
+        """Converts a vector of non-negative digits in given radix into a number"""
+        res = 0
+        for i, d in enumerate(reversed(digits)):
+            res += max(d - 1, 0) * radix ** i
+        return res
+
+    @staticmethod
+    def add_argparse_args(parser: Union[_ArgumentGroup, ArgumentParser]):
+        # fmt: off
+        SentencePieceUnigramTokenizer.add_argparse_args(parser)
+        parser.add_argument(
+            "--radix_base",
+            type=int,
+            default=768,
+            help="int: Radix base.",
+        )
+        # fmt: on
+        # return parser

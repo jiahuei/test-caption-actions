@@ -6,15 +6,13 @@ Created on 06 Jan 2021 21:29:39
 python -m unittest pruning/test_prune.py
 """
 import unittest
-import os
-import numpy as np
 import torch
 from copy import deepcopy
 from torch import nn, optim
 from torch.nn import functional as F
 from pruning import prune
 from pruning.masked_layer import MaskedLinear, MaskedLSTMCell, MaskedEmbedding
-from utils.model_utils import set_seed
+from utils.model_utils import set_seed, map_to_cuda
 
 
 # noinspection PyAbstractClass
@@ -31,12 +29,10 @@ class Model(prune.PruningMixin, nn.Module):
         self.ff = nn.Sequential(*(deepcopy(ffl) for _ in range(2)))
         self.out = MaskedLinear(4, 3, **mask_params)
         self.loss_layer = nn.CrossEntropyLoss()
-        if torch.cuda.is_available():
-            self.cuda()
+        map_to_cuda(self)
 
     def forward(self, inputs):
-        if torch.cuda.is_available():
-            inputs = inputs.cuda()
+        inputs = map_to_cuda(inputs)
         net = F.relu(self.embed(inputs))
         net = F.relu(self.lstm(net)[0])
         for ly in self.ff:
@@ -44,8 +40,7 @@ class Model(prune.PruningMixin, nn.Module):
         return self.out(net)
 
     def compute_loss(self, predictions, labels, sparsity_target=None, step=None, max_step=None):
-        if torch.cuda.is_available():
-            labels = labels.cuda()
+        labels = map_to_cuda(labels)
         loss = self.loss_layer(predictions, labels)
         if self.mask_type == prune.REGULAR:
             assert sparsity_target is not None
@@ -99,6 +94,9 @@ class Model(prune.PruningMixin, nn.Module):
 
 class TestPrune(unittest.TestCase):
     SPARSITY_TARGET = 0.8
+
+    def setUp(self) -> None:
+        set_seed(8888)
 
     def _test_model(self, mask_type):
         model = Model(mask_type)
@@ -157,8 +155,8 @@ class TestPrune(unittest.TestCase):
                 prune.LOTTERY_MAG_DIST,
         ):
             sub_test = f"Testing mask_type = {mask_type}"
-            print(sub_test)
             with self.subTest(sub_test):
+                print(sub_test)
                 self._test_model(mask_type)
 
 

@@ -6,15 +6,12 @@ Created on 21 Apr 2020 00:25:38
 
 import os
 import logging
-from typing import Mapping, Tuple, Iterable, Union
+from typing import Union
 from shutil import copyfile
 from argparse import ArgumentParser, _ArgumentGroup
-from torchvision.transforms import Compose
+# from torchvision.transforms import Compose
 from data import KarpathyDataset, register_dataset
-from utils import (
-    misc as misc_utils,
-    file as file_utils,
-)
+from utils import file as file_utils
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +68,7 @@ class MscocoDataset(KarpathyDataset):
         data = [
             {
                 "img_path": p, "img_id": i,
-                "caption": "", "all_captions": [[""]], "all_gts": [[""]],
+                "caption": "", "all_captions": [""], "all_gts": [""],
             }
             for p, i in zip(img_paths, img_ids)
         ]
@@ -99,3 +96,8 @@ class MscocoDataset(KarpathyDataset):
         )
         # fmt: on
         # return parser
+
+
+@register_dataset("mscoco_testing")
+class MscocoTesting(MscocoDataset):
+    RAW_JSON_FILE = "dataset_coco_testing.json"

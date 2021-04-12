@@ -10,7 +10,7 @@ from opts import parse_opt
 from utils import losses, optim
 from utils.config import Config
 from utils.misc import configure_logging
-from utils.model_utils import set_seed
+from utils.model_utils import set_seed, map_to_cuda
 from utils.lightning import LightningModule
 
 
@@ -25,7 +25,7 @@ class CaptioningModel(LightningModule):
         batch_size = self.train_loader.batch_size
 
         # Assure in training mode
-        model.cuda()
+        map_to_cuda(model)
         model.train()
         # Save init weights for Lottery Ticket
         torch.save(model.state_dict(), self.checkpoint_path.format("init"))
@@ -51,16 +51,17 @@ class CaptioningModel(LightningModule):
                 sc_flag = False
 
             for batch_idx, data in enumerate(self.train_loader):
-                data = {
-                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v
-                    for k, v in data.items()
-                }
+                data = map_to_cuda(data)
                 optimizer.zero_grad()
 
                 if not sc_flag:
-                    loss = loss_fn(
-                        model(**data), data["seqs"][:, 1:], data["masks"][:, 1:]
-                    )
+                    # loss = loss_fn(
+                    #     model(**data), data["seqs"][:, 1:], data["masks"][:, 1:]
+                    # )
+                    outputs = model(**data)
+                    loss = loss_fn(outputs, data["seqs"][:, 1:], data["masks"][:, 1:])
+                    # loss1 = loss_fn(outputs[1], data["seqs"][:, 1:], data["masks"][:, 1:])  # computer output
+                    # loss = loss0 + 0.5 * loss1
                     reward = sc_sample = sc_greedy = None
                 else:
                     loss, reward, sc_sample, sc_greedy = self.compute_scst_loss(
@@ -76,7 +77,7 @@ class CaptioningModel(LightningModule):
                 # Console log
                 if self.global_step % 5 == 0:
                     num_ex = batch_size * 5 * (1 if sc_flag else config.seq_per_img)
-                    t_taken = time() - t_start
+                    t_taken, t_start = time() - t_start, time()
                     eta = (
                             (len(self.train_loader) * config.max_epochs - self.global_step)
                             * (t_taken / 5) / 3600
@@ -87,7 +88,6 @@ class CaptioningModel(LightningModule):
                         f"Speed = {num_ex / t_taken:4.0f} ex/sec, ETA = {eta:5.1f} hr, "
                         f"LR = {optimizer.rate():.2e}"
                     )
-                    t_start = time()
                     if not sc_flag:
                         print(f"{log_str}, Loss = {train_loss:6.3f}")
                     else:
